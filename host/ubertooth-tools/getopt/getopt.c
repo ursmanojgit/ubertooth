@@ -756,9 +756,7 @@ _getopt_internal (argc, argv, optstring, longopts, longind, long_only)
 	      else
 		{
 		  if (print_errors)
-		    fprintf (stderr,
-			   _("%s: option `%s' requires an argument\n"),
-			   argv[0], argv[optind - 1]);
+		    fprintf (stderr, _("%s: option `%s' requires an argument\n"), argv[0], argv[optind - 1]);
 		  nextchar += strlen (nextchar);
 		  optopt = pfound->val;
 		  return optstring[0] == ':' ? ':' : '?';
@@ -1005,7 +1003,7 @@ getopt (argc, argv, optstring)
      char *const *argv;
      const char *optstring;
 {
-  return _getopt_internal (argc, argv, optstring,
+    	 return _getopt_internal (argc, argv, optstring,
 			   (const struct option *) 0,
 			   (int *) 0,
 			   0);

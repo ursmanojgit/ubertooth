@@ -645,6 +645,9 @@ void cb_btle(void* args, usb_pkt_rx *rx, int bank)
 		return;
 	}
 
+	/** Ahmed Salem **/
+	printf("Packet Type: %d\n", rx->pkt_type);
+
 	uint64_t nowns = now_ns_from_clk100ns( rx );
 
 	/* Sanity check */
@@ -684,6 +687,136 @@ void cb_btle(void* args, usb_pkt_rx *rx, int bank)
 					refAA, pkt);
 		lell_pcap_append_ppi_packet(h_pcap_le, nowns,
 					    rx->clkn_high, 
+					    rx->rssi_min, rx->rssi_max,
+					    rx->rssi_avg, rx->rssi_count,
+					    pkt);
+	}
+#endif
+	if (h_pcapng_le) {
+		lell_pcapng_append_packet(h_pcapng_le, nowns,
+					  sig, noise,
+					  refAA, pkt);
+	}
+
+	u32 ts_diff = rx->clk100ns - prev_ts;
+	prev_ts = rx->clk100ns;
+	printf("systime=%u freq=%d addr=%08x delta_t=%.03f ms\n",
+	       systime, rx->channel + 2402, lell_get_access_address(pkt),
+	       ts_diff / 10000.0);
+
+	int len = (rx->data[5] & 0x3f) + 6 + 3;
+	if (len > 50) len = 50;
+
+	for (i = 4; i < len; ++i)
+		printf("%02x ", rx->data[i]);
+	printf("\n");
+
+	lell_print(pkt);
+	printf("\n");
+
+	lell_packet_unref(pkt);
+
+	fflush(stdout);
+}
+
+/*
+ * Selective Sniff Bluetooth Low Energy packets.
+ * Ahmed Salem
+ */
+
+void cb_btle_h(void* args, usb_pkt_rx *rx, int bank, u8 *address)
+{
+
+	lell_packet * pkt;
+	btle_options * opts = (btle_options *) args;
+	int i;
+	// u32 access_address = 0; // Build warning
+
+	static u32 prev_ts = 0;
+	uint32_t refAA;
+	int8_t sig, noise;
+
+	UNUSED(bank);
+
+	// display LE promiscuous mode state changes
+	if (rx->pkt_type == LE_PROMISC) {
+		u8 state = rx->data[0];
+		void *val = &rx->data[1];
+
+		printf("--------------------\n");
+		printf("LE Promisc - ");
+		switch (state) {
+			case 0:
+				printf("Access Address: %08x\n", *(uint32_t *)val);
+				break;
+			case 1:
+				printf("CRC Init: %06x\n", *(uint32_t *)val);
+				break;
+			case 2:
+				printf("Hop interval: %g ms\n", *(uint16_t *)val * 1.25);
+				break;
+			case 3:
+				printf("Hop increment: %u\n", *(uint8_t *)val);
+				break;
+			default:
+				printf("Unknown %u\n", state);
+				break;
+		};
+		printf("\n");
+
+		return;
+	}
+
+	/** Ahmed Salem **/
+	printf("Packet Type: %d\n", rx->pkt_type);
+
+	uint64_t nowns = now_ns_from_clk100ns( rx );
+
+	/* Sanity check */
+	if (rx->channel > (NUM_BREDR_CHANNELS-1))
+		return;
+
+	if (infile == NULL)
+		systime = time(NULL);
+
+	if(address[0] == 0){
+		printf("AdvA: ");
+		for (i = 6; i < 12; ++i)
+				printf("%02x ", rx->data[i]);
+			printf("\n");
+			return;
+		}
+
+	/* Dump to sumpfile if specified */
+	if (dumpfile) {
+		uint32_t systime_be = htobe32(systime);
+		if (fwrite(&systime_be, sizeof(systime_be), 1, dumpfile) != 1) {;}
+		if (fwrite(rx, sizeof(usb_pkt_rx), 1, dumpfile) != 1) {;}
+		fflush(dumpfile);
+	}
+
+	lell_allocate_and_decode(rx->data, rx->channel + 2402, rx->clk100ns, &pkt);
+
+	/* do nothing further if filtered due to bad AA */
+	if (opts &&
+	    (opts->allowed_access_address_errors <
+	     lell_get_access_address_offenses(pkt))) {
+		lell_packet_unref(pkt);
+		return;
+	}
+
+	/* Dump to PCAP/PCAPNG if specified */
+	refAA = lell_packet_is_data(pkt) ? 0 : 0x8e89bed6;
+	determine_signal_and_noise( rx, &sig, &noise );
+#ifdef ENABLE_PCAP
+	if (h_pcap_le) {
+		/* only one of these two will succeed, depending on
+		 * whether PCAP was opened with DLT_PPI or not */
+		lell_pcap_append_packet(h_pcap_le, nowns,
+					sig, noise,
+					refAA, pkt);
+		lell_pcap_append_ppi_packet(h_pcap_le, nowns,
+					    rx->clkn_high,
 					    rx->rssi_min, rx->rssi_max,
 					    rx->rssi_avg, rx->rssi_count,
 					    pkt);
@@ -914,4 +1047,118 @@ struct libusb_device_handle* ubertooth_start(int ubertooth_device)
 	}
 
 	return devh;
+}
+
+static void cb_br_tx(void* args, usb_pkt_rx *rx, int bank)
+{
+	fprintf(stderr, "cb_br_tx: nothing to do yet\n");
+}
+
+void tx_live(struct libusb_device_handle* devh, btbb_piconet* pn, int timeout){
+
+	int r = btbb_init(max_ac_errors);
+	if (r < 0)
+		return;
+
+	if (timeout)
+		set_timeout(timeout);
+
+	if (follow_pn){
+		printf("In 1...\n");
+		cmd_set_clock(devh, 0);
+	}else {
+		printf("In 2...\n");
+		stream_tx_usb(devh, XFER_LEN, 0, cb_br_tx, pn);
+		/* Allow pending transfers to finish */
+		sleep(1);
+	}
+
+	/* Used when follow_pn is preset OR set by stream_rx_usb above
+	 * i.e. This cannot be rolled in to the above if...else
+	 */
+	if (follow_pn) {
+		printf("In 3...\n");
+		cmd_stop(devh);
+		cmd_set_bdaddr(devh, btbb_piconet_get_bdaddr(follow_pn));
+		cmd_start_hopping(devh, btbb_piconet_get_clk_offset(follow_pn));
+		stream_rx_usb(devh, XFER_LEN, 0, cb_br_tx, follow_pn);
+	}
+
+
+}
+
+int stream_tx_usb(struct libusb_device_handle* devh, int xfer_size, uint16_t num_blocks, rx_callback cb, void* cb_args)
+{
+	int r;
+	int i=0;
+	int xfer_blocks;
+	int num_xfers;
+	usb_pkt_rx* rx;
+	uint8_t bank = 0;
+	uint8_t rx_buf1[BUFFER_SIZE];
+	uint8_t rx_buf2[BUFFER_SIZE]="1234435345";
+
+	/*
+	 * A block is 64 bytes transferred over USB (includes 50 bytes of rx symbol
+	 * payload).  A transfer consists of one or more blocks.  Consecutive
+	 * blocks should be approximately 400 microseconds apart (timestamps about
+	 * 4000 apart in units of 100 nanoseconds).
+	 */
+	if (xfer_size > BUFFER_SIZE)
+		xfer_size = BUFFER_SIZE;
+	xfer_blocks = xfer_size / PKT_LEN;
+	xfer_size = xfer_blocks * PKT_LEN;
+	num_xfers = num_blocks / xfer_blocks;
+	num_blocks = num_xfers * xfer_blocks;
+
+	/*
+	fprintf(stderr, "rx %d blocks of 64 bytes in %d byte transfers\n",
+		num_blocks, xfer_size);
+	*/
+
+	empty_usb_buf = &rx_buf1[0];
+	full_usb_buf = &rx_buf2[0];
+
+
+	for(i=0;i < 1000;i++){
+	//	printf("Tx %d...\n",i);
+		usb_really_full = 0;
+		rx_xfer = libusb_alloc_transfer(0);
+		libusb_fill_bulk_transfer(rx_xfer, devh, DATA_OUT, full_usb_buf,
+				xfer_size, cb_xfer, NULL, TIMEOUT);
+
+		cmd_rx_syms(devh, num_blocks);
+
+		r = libusb_submit_transfer(rx_xfer);
+		if (r < 0) {
+			fprintf(stderr, "rx_xfer submission: %d\n", r);
+			return -1;
+		}
+	}
+
+//	while (1) {
+//		while (!usb_really_full) {
+//			handle_events_wrapper();
+//		}
+//
+//		/* process each received block */
+//		for (i = 0; i < xfer_blocks; i++) {
+//			rx = (usb_pkt_rx *)(full_usb_buf + PKT_LEN * i);
+//			if(rx->pkt_type != KEEP_ALIVE)
+//				(*cb)(cb_args, rx, bank);
+//			bank = (bank + 1) % NUM_BANKS;
+//			if(stop_ubertooth) {
+//				stop_ubertooth = 0;
+//				usb_really_full = 0;
+//				usb_retry = 0;
+//				handle_events_wrapper();
+//				usb_retry = 1;
+//				return 1;
+//			}
+//		}
+//		usb_really_full = 0;
+//		fflush(stderr);
+//	}
+
+	return 0;
 }

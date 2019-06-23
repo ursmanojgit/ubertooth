@@ -59,11 +59,15 @@ int stream_rx_usb(struct libusb_device_handle* devh, int xfer_size,
 	uint16_t num_blocks, rx_callback cb, void* cb_args);
 int stream_rx_file(FILE* fp, uint16_t num_blocks, rx_callback cb, void* cb_args);
 void rx_live(struct libusb_device_handle* devh, btbb_piconet* pn, int timeout);
+void tx_live(struct libusb_device_handle* devh, btbb_piconet* pn, int timeout);
 void rx_file(FILE* fp, btbb_piconet* pn);
 void rx_dump(struct libusb_device_handle* devh, int full);
 void rx_btle(struct libusb_device_handle* devh);
 void rx_btle_file(FILE* fp);
 void cb_btle(void* args, usb_pkt_rx *rx, int bank);
+void cb_btle_h(void* args, usb_pkt_rx *rx, int bank, u8 *address);
+int stream_tx_usb(struct libusb_device_handle* devh, int xfer_size,
+		uint16_t num_blocks, rx_callback cb, void* cb_args);
 
 #ifdef ENABLE_PCAP
 extern btbb_pcap_handle * h_pcap_bredr;

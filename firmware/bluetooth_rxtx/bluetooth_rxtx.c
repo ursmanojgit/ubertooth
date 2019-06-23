@@ -127,6 +127,8 @@ char unpacked[DMA_SIZE*8*2];
 volatile u8 mode = MODE_IDLE;
 volatile u8 requested_mode = MODE_IDLE;
 volatile u8 modulation = MOD_BT_BASIC_RATE;
+volatile u8 ble_modulation = MOD_BT_LOW_ENERGY;
+volatile u16 ble_channel = 2402;
 volatile u16 channel = 2441;
 volatile u16 requested_channel = 0;
 volatile u16 saved_request = 0;
@@ -458,6 +460,7 @@ static int vendor_request_handler(u8 request, u16 *request_params, u8 *data, int
 		break;
 #endif
 
+
 #ifdef TX_ENABLE
 	case UBERTOOTH_TX_TEST:
 		requested_mode = MODE_TX_TEST;
@@ -731,6 +734,21 @@ static int vendor_request_handler(u8 request, u16 *request_params, u8 *data, int
 	case UBERTOOTH_BTLE_SLAVE:
 		memcpy(slave_mac_address, data, 6);
 		requested_mode = MODE_BT_SLAVE_LE;
+		break;
+
+	case UBERTOOTH_BTLE_TX:
+//		rx_pkts += request_params[0];
+//		if (rx_pkts == 0)
+//			rx_pkts = 0xFFFFFFFF;
+//		*data_len = 0;
+
+//		do_hop = 0;
+//		hop_mode = HOP_BTLE;
+
+		requested_mode = MODE_BT_TX_LE;
+
+		queue_init();
+		cs_threshold_calc_and_set();
 		break;
 
 	case UBERTOOTH_BTLE_SET_TARGET:
@@ -1219,6 +1237,7 @@ void le_transmit(u32 aa, u8 len, u8 *data)
 		}
 	}
 
+
 	// whiten the data and copy it into the txbuf
 	int idx = whitening_index[btle_channel_index(channel-2402)];
 	for (i = 0; i < len; ++i) {
@@ -1295,6 +1314,31 @@ void le_transmit(u32 aa, u8 len, u8 *data)
 	cc2400_set(IOCFG, gio_save);
 }
 
+/*
+ * Ahmed
+ *BTLE ADV Channel Hop
+ * **/
+void hop_adv(void)
+{
+	u8 found_hop = 0;
+
+	if (channel == 2402){ //37
+		channel = 2426;
+		found_hop =1;
+	}else if(channel == 2426){ //38
+		channel = 2480;
+		found_hop = 1;
+	}else if(channel == 2480){ //39
+		channel = 2402;
+		found_hop = 1;
+	}
+
+	if(found_hop){
+		found_hop = 0;
+		cs_threshold_calc_and_set();
+	}
+
+}
 /* TODO - return whether hop happened, or should caller have to keep
  * track of this? */
 void hop(void)
@@ -1807,6 +1851,182 @@ void bt_generic_le(u8 active_mode)
 }
 
 
+void bt_le_sync_single(u8 active_mode){
+
+	int i;
+	int8_t rssi;
+
+	modulation = MOD_BT_LOW_ENERGY;
+	mode = active_mode;
+
+	le.link_state = LINK_LISTENING;
+
+	// enable USB interrupts
+	ISER0 = ISER0_ISE_USB;
+
+	RXLED_CLR;
+
+	queue_init();
+	dio_ssp_init();
+	dma_init_le();
+	dio_ssp_start();
+
+	cc2400_rx_sync(rbit(le.access_address)); // bit-reversed access address
+
+//	while (requested_mode == active_mode) {
+		if (requested_channel != 0) {
+			cc2400_strobe(SRFOFF);
+			while ((cc2400_status() & FS_LOCK)); // need to wait for unlock?
+
+			/* Retune */
+			cc2400_set(FSDIV, channel - 1);
+
+			/* Wait for lock */
+			cc2400_strobe(SFSON);
+			while (!(cc2400_status() & FS_LOCK));
+
+			/* RX mode */
+			cc2400_strobe(SRX);
+
+			saved_request = requested_channel;
+			requested_channel = 0;
+		}
+
+		RXLED_CLR;
+
+		/* Wait for DMA. Meanwhile keep track of RSSI. */
+		rssi_reset();
+		while ((rx_tc == 0) && (rx_err == 0) && (do_hop == 0) && requested_mode == active_mode)
+			;
+
+		if (requested_mode != active_mode) {
+			goto cleanup;
+		}
+
+		if (rx_err) {
+			status |= DMA_ERROR;
+		}
+
+		if (do_hop)
+			goto rx_flush;
+
+		/* No DMA transfer? */
+//		if (!rx_tc)
+//			continue;
+
+		/////////////////////
+		// process the packet
+
+		uint32_t packet[48/4+1];
+		u8 *p = (u8 *)packet;
+		packet[0] = le.access_address;
+
+		const uint32_t *whit = whitening_word[btle_channel_index(channel-2402)];
+		for (i = 0; i < 4; i+= 4) {
+			uint32_t v = rxbuf1[i+0] << 24
+					   | rxbuf1[i+1] << 16
+					   | rxbuf1[i+2] << 8
+					   | rxbuf1[i+3] << 0;
+			packet[i/4+1] = rbit(v) ^ whit[i/4];
+		}
+
+		unsigned len = (p[5] & 0x3f) + 2;
+		if (len > 39)
+			goto rx_flush;
+
+		// transfer the minimum number of bytes from the CC2400
+		// this allows us enough time to resume RX for subsequent packets on the same channel
+		unsigned total_transfers = ((len + 3) + 4 - 1) / 4;
+		if (total_transfers < 11) {
+			while (DMACC0DestAddr < (uint32_t)rxbuf1 + 4 * total_transfers && rx_err == 0)
+				;
+		} else { // max transfers? just wait till DMA's done
+			while (DMACC0Config & DMACCxConfig_E && rx_err == 0)
+				;
+		}
+		DIO_SSP_DMACR &= ~SSPDMACR_RXDMAE;
+
+		// unwhiten the rest of the packet
+		for (i = 4; i < 44; i += 4) {
+			uint32_t v = rxbuf1[i+0] << 24
+					   | rxbuf1[i+1] << 16
+				       | rxbuf1[i+2] << 8
+					   | rxbuf1[i+3] << 0;
+			packet[i/4+1] = rbit(v) ^ whit[i/4];
+		}
+
+		if (le.crc_verify) {
+			u32 calc_crc = btle_crcgen_lut(le.crc_init_reversed, p + 4, len);
+			u32 wire_crc = (p[4+len+2] << 16)
+						 | (p[4+len+1] << 8)
+						 | (p[4+len+0] << 0);
+			if (calc_crc != wire_crc) // skip packets with a bad CRC
+				goto rx_flush;
+		}
+
+
+		RXLED_SET;
+		packet_cb((uint8_t *)packet);
+		enqueue(LE_PACKET, (uint8_t *)packet);
+		le.last_packet = CLK100NS;
+
+	rx_flush:
+		cc2400_strobe(SFSON);
+		while (!(cc2400_status() & FS_LOCK));
+
+		// flush any excess bytes from the SSP's buffer
+		DIO_SSP_DMACR &= ~SSPDMACR_RXDMAE;
+		while (SSP1SR & SSPSR_RNE) {
+			u8 tmp = (u8)DIO_SSP_DR;
+		}
+
+		// timeout - FIXME this is an ugly hack
+		if ((le.link_state == LINK_CONNECTED || le.link_state == LINK_CONN_PENDING)
+			&& (CLK100NS - le.last_packet > 50000000))
+		{
+			reset_le();
+			le.link_state = LINK_LISTENING;
+
+			cc2400_strobe(SRFOFF);
+			while ((cc2400_status() & FS_LOCK));
+
+			/* Retune */
+			channel = saved_request != 0 ? saved_request : 2402;
+			cc2400_set(FSDIV, channel - 1);
+
+			/* Wait for lock */
+			cc2400_strobe(SFSON);
+			while (!(cc2400_status() & FS_LOCK));
+		}
+
+		cc2400_set(SYNCL, le.syncl);
+		cc2400_set(SYNCH, le.synch);
+
+		if (do_hop)
+			hop();
+
+		/* RX mode */
+		dma_init_le();
+		dio_ssp_start();
+		cc2400_strobe(SRX);
+
+	rx_continue:
+		rx_tc = 0;
+		rx_err = 0;
+//	}
+
+cleanup:
+
+	// disable USB interrupts
+	ICER0 = ICER0_ICE_USB;
+
+	// reset the radio completely
+	cc2400_idle();
+	dio_ssp_stop();
+	cs_trigger_disable();
+
+}
+
 void bt_le_sync(u8 active_mode)
 {
 	int i;
@@ -2146,6 +2366,18 @@ void bt_follow_le() {
 	*/
 }
 
+void  bt_follow_le_single() {
+	reset_le();
+	packet_cb = connection_follow_cb;
+	bt_le_sync_single(MODE_BT_FOLLOW_LE);
+
+	/* old non-sync mode
+	data_cb = cb_follow_le;
+	packet_cb = connection_follow_cb;
+	bt_generic_le(MODE_BT_FOLLOW_LE);
+	*/
+}
+
 // issue state change message
 void le_promisc_state(u8 type, void *data, unsigned len) {
 	u8 buf[50] = { 0, };
@@ -2392,6 +2624,146 @@ void bt_promisc_le() {
 	bt_le_sync(MODE_BT_PROMISC_LE);
 }
 
+
+void h_transmit_init(){
+
+//	u32 calc_crc;
+//
+//		u8 adv_ind[] = {
+//			// LL header
+//			0x00, 0x08,
+//
+//			// advertising address
+//			0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+//
+//			// advertising data
+//		    0x1D, 0x3F,
+//
+//			// CRC (calc)4a 5f 3b
+//			0xff, 0xff, 0xff,
+//		};
+//
+
+
+}
+void h_transmit_single(){
+
+//	h_transmit_init();
+
+	u32 calc_crc_h;
+	u32 i_h;
+	u16 period;
+
+	u8 adv_ind_h[] = {
+		// LL header
+		0x00, 0x08,
+
+		// advertising address
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+
+		// advertising data
+	    0x1D, 0x3F,
+
+		// CRC (calc)4a 5f 3b
+		0xff, 0xff, 0xff,
+	};
+
+	u8 adv_ind_len_h = sizeof(adv_ind_h)-3;
+
+	// copy the user-specified mac address
+
+	   for (i_h = 0; i_h < 6; ++i_h)
+		 adv_ind_h[i_h+2] = slave_mac_address[5-i_h];
+
+
+	calc_crc_h = btle_calc_crc(le.crc_init_reversed, adv_ind_h, adv_ind_len_h);
+	adv_ind_h[adv_ind_len_h+0] = (calc_crc_h >>  0) & 0xff;
+	adv_ind_h[adv_ind_len_h+1] = (calc_crc_h >>  8) & 0xff;
+	adv_ind_h[adv_ind_len_h+2] = (calc_crc_h >> 16) & 0xff;
+
+	// spam advertising packets
+	while (requested_mode == MODE_BT_TX_LE) {
+
+//		if(do_hop)
+//			hop();
+		hop_adv();
+
+		//msleep(10);
+
+//		for (i_h =0; i_h < 10; i_h++){
+			ICER0 = ICER0_ICE_USB;
+			ICER0 = ICER0_ICE_DMA;
+			le_transmit(0x8e89bed6, adv_ind_len_h+3, adv_ind_h);
+			ISER0 = ISER0_ISE_USB;
+			ISER0 = ISER0_ISE_DMA;
+//		}
+
+
+//		for (i =0; i < 1000; i++){
+////			requested_mode = MODE_BT_FOLLOW_LE;
+////			bt_le_sync_single(MODE_BT_FOLLOW_LE);
+	}
+
+
+/**trying to set requested_mode, halts the performance */
+//		requested_mode = MODE_BT_TX_LE;
+
+
+//	}
+}
+
+void h_recv(){
+
+	//		bt_follow_le_single();
+	requested_mode = MODE_BT_SLAVE_LE;
+	bt_follow_le_single();
+
+}
+
+void h_transmit(){
+	u32 calc_crc;
+	int i;
+
+
+	u8 adv_ind[] = {
+		// LL header
+		0x00, 0x08,
+
+		// advertising address
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+
+		// advertising data
+	    0x1D, 0x3F,
+
+		// CRC (calc)4a 5f 3b
+		0xff, 0xff, 0xff,
+	};
+
+	u8 adv_ind_len = sizeof(adv_ind)-3;
+
+	// copy the user-specified mac address
+
+	   for (i = 0; i < 6; ++i)
+		 adv_ind[i+2] = slave_mac_address[5-i];
+
+
+	calc_crc = btle_calc_crc(le.crc_init_reversed, adv_ind, adv_ind_len);
+	adv_ind[adv_ind_len+0] = (calc_crc >>  0) & 0xff;
+	adv_ind[adv_ind_len+1] = (calc_crc >>  8) & 0xff;
+	adv_ind[adv_ind_len+2] = (calc_crc >> 16) & 0xff;
+
+	// spam advertising packets
+	while (requested_mode == MODE_BT_TX_LE) {
+		ICER0 = ICER0_ICE_USB;
+		ICER0 = ICER0_ICE_DMA;
+		le_transmit(0x8e89bed6, adv_ind_len+3, adv_ind);
+		ISER0 = ISER0_ISE_USB;
+		ISER0 = ISER0_ISE_DMA;
+		//msleep(100);
+
+	}
+}
+
 void bt_slave_le() {
 	u32 calc_crc;
 	int i;
@@ -2484,6 +2856,8 @@ void specan()
 	RXLED_CLR;
 }
 
+
+
 /* LED based spectrum analysis */
 void led_specan()
 {
@@ -2552,6 +2926,34 @@ void led_specan()
 	mode = MODE_IDLE;
 }
 
+void resetUber(){
+	    ubertooth_init();
+		clkn_init();
+		ubertooth_usb_init(vendor_request_handler);
+}
+
+
+void h_discover(){
+
+//	while(requested_mode == MODE_BT_TX_LE || requested_mode == MODE_BT_FOLLOW_LE){
+//		h_transmit_single();
+//		requested_mode = MODE_BT_FOLLOW_LE;
+////		bt_follow_le_single();
+//		requested_mode = MODE_BT_TX_LE;
+//	}
+//	resetUber();
+//	while (1) {
+//		resetUber();
+//		requested_mode = MODE_BT_FOLLOW_LE;
+		h_transmit_single();
+//		wait(1);
+//		resetUber();
+//		requested_mode = MODE_BT_TX_LE;
+//		h_recv();
+//	}
+
+}
+
 int main()
 {
 	ubertooth_init();
@@ -2603,6 +3005,13 @@ int main()
 					break;
 				case MODE_LED_SPECAN:
 					led_specan();
+					break;
+				case MODE_BT_TX_LE:
+					//cc2400_txtest(&modulation, &channel);
+//					h_transmit();
+					h_discover();
+//					h_transmit_single();
+					//h_recv();
 					break;
 				case MODE_IDLE:
 					cc2400_idle();

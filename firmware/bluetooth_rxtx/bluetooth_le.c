@@ -31,6 +31,7 @@ u16 btle_next_hop(le_state_t *le)
 	return phys;
 }
 
+
 u32 received_data = 0;
 
 u8 btle_channel_index(u8 channel) {

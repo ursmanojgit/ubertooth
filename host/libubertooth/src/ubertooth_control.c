@@ -837,6 +837,7 @@ int cmd_poll(struct libusb_device_handle* devh, usb_pkt_rx *p)
 	r = libusb_control_transfer(devh, CTRL_IN, UBERTOOTH_POLL, 0, 0,
 			(u8 *)p, sizeof(usb_pkt_rx), 1000);
 	if (r < 0) {
+		//printf("POLL Error");
 		show_libusb_error(r);
 		return r;
 	}
@@ -897,6 +898,7 @@ int cmd_btle_slave(struct libusb_device_handle* devh, u8 *mac_address)
 	return 0;
 }
 
+
 int cmd_btle_set_target(struct libusb_device_handle* devh, u8 *mac_address)
 {
 	int r;
@@ -907,6 +909,31 @@ int cmd_btle_set_target(struct libusb_device_handle* devh, u8 *mac_address)
 		if (r == LIBUSB_ERROR_PIPE) {
 			fprintf(stderr, "control message unsupported\n");
 		} else {
+			show_libusb_error(r);
+		}
+		return r;
+	}
+
+	return 0;
+}
+
+int cmd_h_btle_tx(struct libusb_device_handle* devh, u8 *mac_address)
+{
+	//fprintf(stderr, ".");
+	//int i=0;
+	//printf("Mac Address:");
+//	for (i = 0; i < 6; ++i)
+//			printf("%02x:", mac_address[i]);
+//	printf("\n");
+
+	int r;
+
+	r = libusb_control_transfer(devh, CTRL_OUT, UBERTOOTH_BTLE_TX, 0, 0, mac_address, 6, 1000);
+	if (r < 0) {
+		if (r == LIBUSB_ERROR_PIPE) {
+			fprintf(stderr, "control message unsupported\n");
+		} else {
+			printf("Error in Libusb_control transfer\n");
 			show_libusb_error(r);
 		}
 		return r;
